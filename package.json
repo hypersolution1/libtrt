@@ -1,6 +1,6 @@
 {
   "name": "libtrt",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "This library performs non-blocking inference on ONNX and tensorrt model.",
   "repository": {
     "type": "git",
