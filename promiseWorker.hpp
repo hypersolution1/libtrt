@@ -9,7 +9,8 @@ class PromiseWorker : public Napi::AsyncWorker {
       std::function<void ()> task, 
       std::function<Napi::Value (Napi::Env env)> resolver)
     : Napi::AsyncWorker(Napi::Function::New(env, [](const Napi::CallbackInfo& info){})), 
-      env(env), deferred(Napi::Promise::Deferred::New(env)), task(task), resolver(resolver) {}
+      env(env), deferred(Napi::Promise::Deferred::New(env)), task(task), resolver(resolver),
+      errstack(Napi::Error::New(env, "")) {}
     ~PromiseWorker() {}
 
     void Execute() {
@@ -35,7 +36,12 @@ class PromiseWorker : public Napi::AsyncWorker {
 
     void OnError(const Napi::Error& e) {
       Napi::HandleScope scope(env);
-      deferred.Reject(e.Value());
+      Napi::Object errobj = e.Value().As<Napi::Object>();
+      Napi::Object curstack = errstack.Value().As<Napi::Object>();
+      std::string stack = curstack.Get("stack").As<Napi::String>();
+      std::string newstack = e.Message() + "\n" + stack;
+      errobj.Set("stack", Napi::String::New(env, newstack));
+      deferred.Reject(errobj);
     }
 
   private:
@@ -43,7 +49,7 @@ class PromiseWorker : public Napi::AsyncWorker {
     Napi::Promise::Deferred deferred;
     std::function<void ()> task;
     std::function<Napi::Value (Napi::Env env)> resolver;
-
+    Napi::Error errstack;
 };
 
 #endif

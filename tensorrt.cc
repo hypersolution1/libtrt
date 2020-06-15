@@ -36,7 +36,7 @@ TensorRT::TensorRT(const Napi::CallbackInfo& info) : Napi::ObjectWrap<TensorRT>(
   //   cache_path = options.Get("cache_path").As<Napi::String>();
   // }
 
-  cache_path = std::string(getenv("HOME")) + "/.libtrt";
+  cache_path = std::string(getenv("HOME")) + "/.cache/libtrt";
 
   struct stat sb;
   if(stat(cache_path.c_str(), &sb)) {
@@ -55,16 +55,28 @@ Napi::Object TensorRT::NewInstance(Napi::Env env, Napi::Value arg) {
   return scope.Escape(napi_value(obj)).ToObject();
 }
 
+#define CHECK_THREAD(status)                                          \
+    do                                                         \
+    {                                                          \
+        auto ret = (status);                                   \
+        if (ret != 0)                                          \
+        {                                                      \
+            throw std::runtime_error("Cuda failure"); \
+        }                                                      \
+    } while (0)
+
+
 #define CHECK(status)                                          \
     do                                                         \
     {                                                          \
         auto ret = (status);                                   \
         if (ret != 0)                                          \
         {                                                      \
-            std::cout << "Cuda failure: " << ret << std::endl; \
-            abort();                                           \
+            Napi::Error::New(env, "Cuda failure").ThrowAsJavaScriptException(); \
+            return env.Undefined(); \
         }                                                      \
     } while (0)
+
 
 
 class Logger : public nvinfer1::ILogger
@@ -185,127 +197,138 @@ Napi::Value TensorRT::load(const Napi::CallbackInfo &info)
 {
   Napi::Env env = info.Env();
 
-  std::string inputpath = info[0].As<Napi::String>();
+  std::string *inputpath = new std::string(info[0].As<Napi::String>());
+  std::string *err = new std::string();
 
-  struct stat sb;
-  if(stat(inputpath.c_str(), &sb)) {
-    Napi::Error::New(env, "File not found").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
-  if((sb.st_mode & S_IFMT) != S_IFREG) {
-    Napi::Error::New(env, "Not a regular File").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
-  long int inputfile_time = sb.st_mtime;
+  PromiseWorker *wk = new PromiseWorker(env,
+  [=]() {
 
-  bool use_trtfile = false;
-  std::string trtfile;
+    struct stat sb;
+    if(stat(inputpath->c_str(), &sb)) {
+      throw std::runtime_error("File not found");
+    }
+    if((sb.st_mode & S_IFMT) != S_IFREG) {
+      throw std::runtime_error("Not a regular File");
+    }
+    long int inputfile_time = sb.st_mtime;
 
-  const char *ext = get_filename_ext(inputpath.c_str());
-  if(strcmp(ext, "trt") == 0) {
+    bool use_trtfile = false;
+    std::string trtfile;
 
-    use_trtfile = true;
-    trtfile = inputpath;
+    const char *ext = get_filename_ext(inputpath->c_str());
+    if(strcmp(ext, "trt") == 0) {
 
-  } else {
+      use_trtfile = true;
+      trtfile = (*inputpath);
 
-    long int trtfile_time = 0;
+    } else {
 
-    std::string base = std::string(basename(inputpath.c_str()));
+      long int trtfile_time = 0;
 
-    trtfile = cache_path + "/" + base + ".trt";
+      std::string base = std::string(basename(inputpath->c_str()));
 
-    if(!stat(trtfile.c_str(), &sb)) {
-      if((sb.st_mode & S_IFMT) == S_IFREG) {
-        trtfile_time = sb.st_mtime;
+      trtfile = cache_path + "/" + base + ".trt";
+
+      if(!stat(trtfile.c_str(), &sb)) {
+        if((sb.st_mode & S_IFMT) == S_IFREG) {
+          trtfile_time = sb.st_mtime;
+        }
       }
+
+      use_trtfile = (trtfile_time > inputfile_time);
+
+      printf("TensorRT::load: %s \n", (use_trtfile) ? "Using Cache" : "Parsing ONNX");
+
     }
 
-    use_trtfile = (trtfile_time > inputfile_time);
+    //return Napi::String::New(env, trtfile);
 
-    printf("TensorRT::load: %s \n", (use_trtfile) ? "Using Cache" : "Parsing ONNX");
-
-  }
-
-  //return Napi::String::New(env, trtfile);
-
-  // deserialize the engine
-  //IRuntime *runtime = createInferRuntime(myLogger);
-  runtime = createInferRuntime(myLogger);
-  assert(runtime != nullptr);
+    // deserialize the engine
+    //IRuntime *runtime = createInferRuntime(myLogger);
+    runtime = createInferRuntime(myLogger);
+    assert(runtime != nullptr);
 #ifdef USEDLACORE
-  if (runtime->getNbDLACores() > 0)
-  {
-    runtime->setDLACore(0);
-  }
+    if (runtime->getNbDLACores() > 0)
+    {
+      runtime->setDLACore(0);
+    }
 #endif
 
-  //ICudaEngine *engine{nullptr};
+    //ICudaEngine *engine{nullptr};
 
-  if (use_trtfile) {
-    std::vector<char> trtModelStream;	
-    size_t size{ 0 };
-    std::ifstream file(trtfile, std::ios::binary);
-    if (file.good())
-    {
-      file.seekg(0, file.end);
-      size = file.tellg();
-      file.seekg(0, file.beg);
-      trtModelStream.resize(size);
-      file.read(trtModelStream.data(), size);
-      file.close();
+    if (use_trtfile) {
+      std::vector<char> trtModelStream;	
+      size_t size{ 0 };
+      std::ifstream file(trtfile, std::ios::binary);
+      if (file.good())
+      {
+        file.seekg(0, file.end);
+        size = file.tellg();
+        file.seekg(0, file.beg);
+        trtModelStream.resize(size);
+        file.read(trtModelStream.data(), size);
+        file.close();
+      }
+      engine = runtime->deserializeCudaEngine(trtModelStream.data(), trtModelStream.size(), nullptr);
+      assert(engine != nullptr);
+    } else {
+      //create a TensorRT model from the onnx model and serialize it to a stream
+      IHostMemory *trtModelStream{nullptr};
+      onnxToTRTModel(inputpath->c_str(), 1, trtModelStream);
+      assert(trtModelStream != nullptr);
+
+      std::ofstream p(trtfile, std::ios::binary);
+      p.write(reinterpret_cast<const char*>(trtModelStream->data()), trtModelStream->size());
+      p.close();
+
+      engine = runtime->deserializeCudaEngine(trtModelStream->data(), trtModelStream->size(), nullptr);
+      assert(engine != nullptr);
+      trtModelStream->destroy();
     }
-    engine = runtime->deserializeCudaEngine(trtModelStream.data(), trtModelStream.size(), nullptr);
-    assert(engine != nullptr);
-  } else {
-    //create a TensorRT model from the onnx model and serialize it to a stream
-    IHostMemory *trtModelStream{nullptr};
-    onnxToTRTModel(inputpath.c_str(), 1, trtModelStream);
-    assert(trtModelStream != nullptr);
 
-    std::ofstream p(trtfile, std::ios::binary);
-    p.write(reinterpret_cast<const char*>(trtModelStream->data()), trtModelStream->size());
-    p.close();
+    //IExecutionContext *context = engine->createExecutionContext();
+    context = engine->createExecutionContext();
+    assert(context != nullptr);
 
-    engine = runtime->deserializeCudaEngine(trtModelStream->data(), trtModelStream->size(), nullptr);
-    assert(engine != nullptr);
-    trtModelStream->destroy();
-  }
+    nbBindings = engine->getNbBindings();
+    if(nbBindings > MAXBINDINGS) {
+      throw std::runtime_error("nbBindings > MAXBINDINGS");
+    }
 
-  //IExecutionContext *context = engine->createExecutionContext();
-  context = engine->createExecutionContext();
-  assert(context != nullptr);
+    //std::cout << "bindings: " << nbBindings << std::endl;
+    for (int i = 0; i < nbBindings; ++i)
+    {
+      //bool isinput = engine->bindingIsInput(i);
+      //std::cout << "binding " << i << ":" << engine->getBindingName(i) << ((isinput) ? " is input " : " is output ");
+      Dims bufdims = engine->getBindingDimensions(i);
+      //std::cout << "[ ";
+      int dataCnt = 1;
+      for (int j = 0; j < bufdims.nbDims; j++)
+      {
+        //std::cout << bufdims.d[j] << ((j == bufdims.nbDims - 1) ? " ]" : ", ");
+        dataCnt *= bufdims.d[j];
+      }
+      //std::cout << std::endl;
+      bufsize[i] = dataCnt;
+      cpubuf[i] = (float *)malloc(dataCnt * sizeof(float));
+      for (int j = 0; j < dataCnt; j++)
+      {
+        cpubuf[i][j] = 0.0;
+      }
+      CHECK_THREAD(cudaMalloc(&gpubuf[i], dataCnt * sizeof(float)));
+    }
 
-  nbBindings = engine->getNbBindings();
-  if(nbBindings > MAXBINDINGS) {
-    Napi::Error::New(env, "nbBindings > MAXBINDINGS").ThrowAsJavaScriptException();
+  },
+  [=](Napi::Env env) -> Napi::Value {
+
+    //cleanup what you allocated
+    delete inputpath;
+    delete err;
+
     return env.Undefined();
-  }
-
-  //std::cout << "bindings: " << nbBindings << std::endl;
-  for (int i = 0; i < nbBindings; ++i)
-  {
-    //bool isinput = engine->bindingIsInput(i);
-    //std::cout << "binding " << i << ":" << engine->getBindingName(i) << ((isinput) ? " is input " : " is output ");
-    Dims bufdims = engine->getBindingDimensions(i);
-    //std::cout << "[ ";
-    int dataCnt = 1;
-    for (int j = 0; j < bufdims.nbDims; j++)
-    {
-      //std::cout << bufdims.d[j] << ((j == bufdims.nbDims - 1) ? " ]" : ", ");
-      dataCnt *= bufdims.d[j];
-    }
-    //std::cout << std::endl;
-    bufsize[i] = dataCnt;
-    cpubuf[i] = (float *)malloc(dataCnt * sizeof(float));
-    for (int j = 0; j < dataCnt; j++)
-    {
-      cpubuf[i][j] = 0.0;
-    }
-    CHECK(cudaMalloc(&gpubuf[i], dataCnt * sizeof(float)));
-  }
-
-  return env.Undefined();
+  });
+  wk->Queue();
+  return wk->Deferred().Promise();
 }
 
 Napi::Value TensorRT::unload(const Napi::CallbackInfo &info)
@@ -406,56 +429,66 @@ Napi::Value TensorRT::execute(const Napi::CallbackInfo &info)
     }
   }
 
-  cudaStream_t stream;
-  CHECK(cudaStreamCreate(&stream));
+  PromiseWorker *wk = new PromiseWorker(env,
+  [=]() {
 
-  for (int i = 0; i < nbBindings; i++)
-  {
-    if(engine->bindingIsInput(i)) {
-      CHECK(cudaMemcpyAsync(gpubuf[i], cpubuf[i], 1 * bufsize[i] * sizeof(float), cudaMemcpyHostToDevice, stream));
-    }
-  }
+    cudaStream_t stream;
+    CHECK_THREAD(cudaStreamCreate(&stream));
 
-  context->enqueue(1, gpubuf, stream, nullptr);
-
-  for (int i = 0; i < nbBindings; i++)
-  {
-    if(!engine->bindingIsInput(i)) {
-      CHECK(cudaMemcpyAsync(cpubuf[i], gpubuf[i], 1 * bufsize[i] * sizeof(float), cudaMemcpyDeviceToHost, stream));
-    }
-  }
-
-  cudaStreamSynchronize(stream);
-
-  cudaStreamDestroy(stream);
-
-  Napi::Object retval = Napi::Object::New(env);
-
-  for (int i = 0; i < nbBindings; ++i)
-  {
-    bool isoutput = !engine->bindingIsInput(i);
-    if(isoutput) {
-      std::string name(engine->getBindingName(i));
-
-      Dims bufdims = engine->getBindingDimensions(i);
-      Napi::Array arrdim = Napi::Array::New(env);
-      for (int j = 0; j < bufdims.nbDims; j++)
-      {
-        arrdim.Set(j, Napi::Number::New(env, bufdims.d[j]));
+    for (int i = 0; i < nbBindings; i++)
+    {
+      if(engine->bindingIsInput(i)) {
+        CHECK_THREAD(cudaMemcpyAsync(gpubuf[i], cpubuf[i], 1 * bufsize[i] * sizeof(float), cudaMemcpyHostToDevice, stream));
       }
-      
-      Napi::Object binding = Napi::Object::New(env);
-      binding.Set("dim", arrdim);
-      Napi::Float32Array data = Napi::Float32Array::New(env, bufsize[i]);
-      std::copy(cpubuf[i], cpubuf[i] + bufsize[i], data.Data());
-      binding.Set("data", data);
-
-      retval.Set(name, binding);
-
     }
-  }
 
-  return retval;
+    context->enqueue(1, gpubuf, stream, nullptr);
+
+    for (int i = 0; i < nbBindings; i++)
+    {
+      if(!engine->bindingIsInput(i)) {
+        CHECK_THREAD(cudaMemcpyAsync(cpubuf[i], gpubuf[i], 1 * bufsize[i] * sizeof(float), cudaMemcpyDeviceToHost, stream));
+      }
+    }
+
+    cudaStreamSynchronize(stream);
+
+    cudaStreamDestroy(stream);
+
+  },
+  [=](Napi::Env env) -> Napi::Value {
+
+    Napi::Object retval = Napi::Object::New(env);
+
+    for (int i = 0; i < nbBindings; ++i)
+    {
+      bool isoutput = !engine->bindingIsInput(i);
+      if(isoutput) {
+        std::string name(engine->getBindingName(i));
+
+        Dims bufdims = engine->getBindingDimensions(i);
+        Napi::Array arrdim = Napi::Array::New(env);
+        for (int j = 0; j < bufdims.nbDims; j++)
+        {
+          arrdim.Set(j, Napi::Number::New(env, bufdims.d[j]));
+        }
+        
+        Napi::Object binding = Napi::Object::New(env);
+        binding.Set("dim", arrdim);
+        Napi::Float32Array data = Napi::Float32Array::New(env, bufsize[i]);
+        std::copy(cpubuf[i], cpubuf[i] + bufsize[i], data.Data());
+        binding.Set("data", data);
+
+        retval.Set(name, binding);
+
+      }
+    }
+
+    return retval;
+
+  });
+  wk->Queue();
+  return wk->Deferred().Promise();
 }
 
 
