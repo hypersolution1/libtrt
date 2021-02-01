@@ -1,7 +1,7 @@
 {
   "name": "libtrt",
-  "version": "0.0.1",
-  "description": "This library performs non-blocking inference on ONNX and tensorrt model.",
+  "version": "0.1.0",
+  "description": "This library performs non-blocking inference on TensorRT models. Supports ONNX models.",
   "repository": {
     "type": "git",
     "url": "https://github.com/hypersolution1/libtrt.git"

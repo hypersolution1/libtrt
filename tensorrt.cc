@@ -24,19 +24,25 @@ TensorRT::TensorRT(const Napi::CallbackInfo& info) : Napi::ObjectWrap<TensorRT>(
   Napi::Env env = info.Env();
   Napi::HandleScope scope(env);
 
-  // Napi::Object options;
+  Napi::Object options;
 
-  // if(info[0].IsObject()) {
-  //   options = info[0].As<Napi::Object>();
-  // } else {
-  //   options = Napi::Object::New(env);
-  // }
+  if(info[0].IsObject()) {
+    options = info[0].As<Napi::Object>();
+  } else {
+    options = Napi::Object::New(env);
+  }
 
-  // if(options.HasOwnProperty("cache_path")) {
-  //   cache_path = options.Get("cache_path").As<Napi::String>();
-  // }
+  if(options.HasOwnProperty("cache_path")) {
+    cache_path = options.Get("cache_path").As<Napi::String>();
+  } else {
+    cache_path = std::string(getenv("HOME")) + "/.cache/libtrt";
+  }
 
-  cache_path = std::string(getenv("HOME")) + "/.cache/libtrt";
+  if(options.HasOwnProperty("fp16")) {
+    mode_fp16 = options.Get("fp16").As<Napi::Boolean>();
+  } else {
+    mode_fp16 = false;
+  }
 
   struct stat sb;
   if(stat(cache_path.c_str(), &sb)) {
@@ -130,12 +136,35 @@ Logger myLogger;
 
 bool onnxToTRTModel(const std::string &modelFile, // name of the onnx model
                     unsigned int maxBatchSize,    // batch size - NB must be at least as large as the batch we want to run with
-                    IHostMemory *&trtModelStream) // output buffer for the TensorRT model
+                    IHostMemory *&trtModelStream,  // output buffer for the TensorRT model
+                    bool mode_fp16)
 {
   // create the builder
   IBuilder *builder = createInferBuilder(myLogger.getTRTLogger());
   assert(builder != nullptr);
+
+#if NV_TENSORRT_MAJOR >= 7
+  const auto explicitBatch = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+  nvinfer1::INetworkDefinition *network = builder->createNetworkV2(explicitBatch);
+
+  nvinfer1::IBuilderConfig *config = builder->createBuilderConfig();
+  assert(config);
+
+  config->setMaxWorkspaceSize(16 * (1 << 20));
+  if (mode_fp16)
+  {
+    config->setFlag(BuilderFlag::kFP16);
+  }
+
+#else
   nvinfer1::INetworkDefinition *network = builder->createNetwork();
+  // Build the engine
+  builder->setMaxBatchSize(maxBatchSize);
+  builder->setMaxWorkspaceSize(1 << 20);
+  // FP32 mode is not permitted with DLA?
+  builder->setFp16Mode(mode_fp16);
+  builder->setInt8Mode(false);
+#endif
 
   auto parser = nvonnxparser::createParser(*network, myLogger.getTRTLogger());
 
@@ -150,29 +179,44 @@ bool onnxToTRTModel(const std::string &modelFile, // name of the onnx model
     return false;
   }
 
-  // Build the engine
-  builder->setMaxBatchSize(maxBatchSize);
-  builder->setMaxWorkspaceSize(1 << 20);
-  // FP32 mode is not permitted with DLA?
-  builder->setFp16Mode(true);
-  builder->setInt8Mode(false);
+#if NV_TENSORRT_MAJOR >= 7
+  IOptimizationProfile* profile = builder->createOptimizationProfile();
+  // profile->setDimensions("input_1", OptProfileSelector::kMIN, Dims4(1,96,96,3));
+  // profile->setDimensions("input_1", OptProfileSelector::kOPT, Dims4(1,96,96,3));
+  // profile->setDimensions("input_1", OptProfileSelector::kMAX, Dims4(1,96,96,3));
+  // config->addOptimizationProfile(profile);
 
-  // if (gArgs.runInInt8)
-  // {
-  //   samplesCommon::setAllTensorScales(network, 127.0f, 127.0f);
-  // }
+  Dims inputDims;
+  bool has_profile = false;
+  for(int i = 0; i < network->getNbInputs(); i++) {
+    ITensor *inp = network->getInput(0);
+    inputDims = inp->getDimensions();
+    // printf("Input: %s\n", inp->getName());
+    // for(int j = 0; j < inputDims.nbDims; j++) {
+    //   printf("Dim: %d\n", inputDims.d[j]);
+    // }
+    if(inputDims.d[0] == -1) {
+      has_profile = true;
+      inputDims.d[0] = 1;
+      profile->setDimensions(inp->getName(), OptProfileSelector::kMIN, inputDims);
+      inputDims.d[0] = maxBatchSize;
+      profile->setDimensions(inp->getName(), OptProfileSelector::kOPT, inputDims);
+      inputDims.d[0] = maxBatchSize;
+      profile->setDimensions(inp->getName(), OptProfileSelector::kMAX, inputDims);
+    }
 
-#ifdef USEDLACORE
-  if (builder->getNbDLACores() > 0)
-  {
-    builder->allowGPUFallback(true);
-    builder->setDefaultDeviceType(DeviceType::kDLA);
-    builder->setDLACore(0);
-    builder->setStrictTypeConstraints(true);
+  }
+
+  if(has_profile) {
+    config->addOptimizationProfile(profile);
   }
 #endif
 
+#if NV_TENSORRT_MAJOR >= 7
+  ICudaEngine *engine = builder->buildEngineWithConfig(*network, *config);
+#else
   ICudaEngine *engine = builder->buildCudaEngine(*network);
+#endif
   assert(engine);
 
   // we can destroy the parser
@@ -274,7 +318,7 @@ Napi::Value TensorRT::load(const Napi::CallbackInfo &info)
     } else {
       //create a TensorRT model from the onnx model and serialize it to a stream
       IHostMemory *trtModelStream{nullptr};
-      onnxToTRTModel(inputpath->c_str(), 1, trtModelStream);
+      onnxToTRTModel(inputpath->c_str(), 1, trtModelStream, mode_fp16);
       assert(trtModelStream != nullptr);
 
       std::ofstream p(trtfile, std::ios::binary);
@@ -404,7 +448,8 @@ Napi::Value TensorRT::execute(const Napi::CallbackInfo &info)
       std::string name(engine->getBindingName(i));
       Dims bufdims = engine->getBindingDimensions(i);
       if(!inputs.HasOwnProperty(name)) {
-        Napi::Error::New(env, "Bad Input").ThrowAsJavaScriptException();
+        std::string err("Bad Input, expecting: " + name);
+        Napi::Error::New(env, err).ThrowAsJavaScriptException();
         return env.Undefined();
       }
       Napi::Object input = inputs.Get(name).As<Napi::Object>();

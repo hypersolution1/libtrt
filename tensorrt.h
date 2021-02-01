@@ -42,6 +42,7 @@ class TensorRT : public Napi::ObjectWrap<TensorRT> {
 
     //
     std::string cache_path;
+    bool mode_fp16;
     IRuntime *runtime{nullptr};
     ICudaEngine *engine{nullptr};
     IExecutionContext *context{nullptr};
