@@ -11,6 +11,7 @@ Napi::Object TensorRT::Init(Napi::Env env, Napi::Object exports) {
       InstanceMethod("unload", &TensorRT::unload),
       InstanceMethod("info", &TensorRT::info),
       InstanceMethod("execute", &TensorRT::execute),
+      InstanceMethod("yolo", &TensorRT::yolo),
   });
 
   constructor = Napi::Persistent(func);
@@ -339,6 +340,8 @@ Napi::Value TensorRT::load(const Napi::CallbackInfo &info)
       throw std::runtime_error("nbBindings > MAXBINDINGS");
     }
 
+    maxBatchSize = engine->getMaxBatchSize();
+
     //std::cout << "bindings: " << nbBindings << std::endl;
     for (int i = 0; i < nbBindings; ++i)
     {
@@ -354,6 +357,7 @@ Napi::Value TensorRT::load(const Napi::CallbackInfo &info)
       }
       //std::cout << std::endl;
       bufsize[i] = dataCnt;
+      dataCnt *= maxBatchSize;
       cpubuf[i] = (float *)malloc(dataCnt * sizeof(float));
       for (int j = 0; j < dataCnt; j++)
       {
@@ -398,6 +402,7 @@ Napi::Value TensorRT::info(const Napi::CallbackInfo &info)
   Napi::Object retval = Napi::Object::New(env);
   Napi::Array inputs = Napi::Array::New(env);
   Napi::Array outputs = Napi::Array::New(env);  
+  retval.Set("maxBatchSize", Napi::Number::New(env, maxBatchSize));
   retval.Set("inputs", inputs);
   retval.Set("outputs", outputs);
 
@@ -468,9 +473,32 @@ Napi::Value TensorRT::execute(const Napi::CallbackInfo &info)
         }
       }
 
-      Napi::TypedArray arrdata = input.Get("data").As<Napi::TypedArray>();
-      Napi::Float32Array arrdata_float = arrdata.As<Napi::Float32Array>();
-      std::copy(arrdata_float.Data(), arrdata_float.Data() + bufsize[i], cpubuf[i]);
+      Napi::Array arrbatchData;
+      if(input.Get("data").IsArray()) {
+        input_is_array = true;
+        arrbatchData = input.Get("data").As<Napi::Array>();
+      } else {
+        input_is_array = false;
+        arrbatchData = Napi::Array::New(env);
+        //Napi::TypedArray arrdata = input.Get("data").As<Napi::TypedArray>();
+        arrbatchData.Set((int)0, input.Get("data"));
+      }
+
+      batchSize = arrbatchData.Length();
+      if(batchSize > maxBatchSize) {
+        Napi::Error::New(env, "Input greater than maximum batch size").ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+      for(int j = 0; j < batchSize; j++) {
+        Napi::TypedArray arrdata = arrbatchData.Get(j).As<Napi::TypedArray>();
+        Napi::Float32Array arrdata_float = arrdata.As<Napi::Float32Array>();
+        std::copy(arrdata_float.Data(), arrdata_float.Data() + bufsize[i], cpubuf[i] + (j * bufsize[i]));
+      }
+
+      // Napi::TypedArray arrdata = input.Get("data").As<Napi::TypedArray>();
+      // Napi::Float32Array arrdata_float = arrdata.As<Napi::Float32Array>();
+      // std::copy(arrdata_float.Data(), arrdata_float.Data() + bufsize[i], cpubuf[i]);
+
     }
   }
 
@@ -483,16 +511,16 @@ Napi::Value TensorRT::execute(const Napi::CallbackInfo &info)
     for (int i = 0; i < nbBindings; i++)
     {
       if(engine->bindingIsInput(i)) {
-        CHECK_THREAD(cudaMemcpyAsync(gpubuf[i], cpubuf[i], 1 * bufsize[i] * sizeof(float), cudaMemcpyHostToDevice, stream));
+        CHECK_THREAD(cudaMemcpyAsync(gpubuf[i], cpubuf[i], maxBatchSize * bufsize[i] * sizeof(float), cudaMemcpyHostToDevice, stream));
       }
     }
 
-    context->enqueue(1, gpubuf, stream, nullptr);
+    context->enqueue(maxBatchSize, gpubuf, stream, nullptr);
 
     for (int i = 0; i < nbBindings; i++)
     {
       if(!engine->bindingIsInput(i)) {
-        CHECK_THREAD(cudaMemcpyAsync(cpubuf[i], gpubuf[i], 1 * bufsize[i] * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CHECK_THREAD(cudaMemcpyAsync(cpubuf[i], gpubuf[i], maxBatchSize * bufsize[i] * sizeof(float), cudaMemcpyDeviceToHost, stream));
       }
     }
 
@@ -520,9 +548,23 @@ Napi::Value TensorRT::execute(const Napi::CallbackInfo &info)
         
         Napi::Object binding = Napi::Object::New(env);
         binding.Set("dim", arrdim);
-        Napi::Float32Array data = Napi::Float32Array::New(env, bufsize[i]);
-        std::copy(cpubuf[i], cpubuf[i] + bufsize[i], data.Data());
-        binding.Set("data", data);
+
+        Napi::Array arrdata = Napi::Array::New(env);
+        for(int j = 0; j < batchSize; j++) {
+          Napi::Float32Array data = Napi::Float32Array::New(env, bufsize[i]);
+          std::copy(cpubuf[i] + (j * bufsize[i]), cpubuf[i] + ((j+1) * bufsize[i]), data.Data());
+          arrdata.Set(j, data);
+        }
+        if(input_is_array) {
+          binding.Set("data", arrdata);
+        } else {
+          //Napi::Value val = .As<Napi::Value>();
+          binding.Set("data", arrdata.Get((int)0));
+        }
+
+        // Napi::Float32Array data = Napi::Float32Array::New(env, bufsize[i]);
+        // std::copy(cpubuf[i], cpubuf[i] + bufsize[i], data.Data());
+        // binding.Set("data", data);
 
         retval.Set(name, binding);
 
@@ -536,6 +578,130 @@ Napi::Value TensorRT::execute(const Napi::CallbackInfo &info)
   return wk->Deferred().Promise();
 }
 
+void get_rect(int cols, int rows, float bbox[4], int *out) {
+    int l, r, t, b;
+    float r_w = Yolo::INPUT_W / (cols * 1.0);
+    float r_h = Yolo::INPUT_H / (rows * 1.0);
+    if (r_h > r_w) {
+        l = bbox[0] - bbox[2] / 2.f;
+        r = bbox[0] + bbox[2] / 2.f;
+        t = bbox[1] - bbox[3] / 2.f - (Yolo::INPUT_H - r_w * rows) / 2;
+        b = bbox[1] + bbox[3] / 2.f - (Yolo::INPUT_H - r_w * rows) / 2;
+        l = l / r_w;
+        r = r / r_w;
+        t = t / r_w;
+        b = b / r_w;
+    } else {
+        l = bbox[0] - bbox[2] / 2.f - (Yolo::INPUT_W - r_h * cols) / 2;
+        r = bbox[0] + bbox[2] / 2.f - (Yolo::INPUT_W - r_h * cols) / 2;
+        t = bbox[1] - bbox[3] / 2.f;
+        b = bbox[1] + bbox[3] / 2.f;
+        l = l / r_h;
+        r = r / r_h;
+        t = t / r_h;
+        b = b / r_h;
+    }
+    out[0] = l;
+    out[1] = t;
+    out[2] = r - l;
+    out[3] = b - t;
+}
+
+float iou(float lbox[4], float rbox[4]) {
+    float interBox[] = {
+        (std::max)(lbox[0] - lbox[2] / 2.f , rbox[0] - rbox[2] / 2.f), //left
+        (std::min)(lbox[0] + lbox[2] / 2.f , rbox[0] + rbox[2] / 2.f), //right
+        (std::max)(lbox[1] - lbox[3] / 2.f , rbox[1] - rbox[3] / 2.f), //top
+        (std::min)(lbox[1] + lbox[3] / 2.f , rbox[1] + rbox[3] / 2.f), //bottom
+    };
+
+    if (interBox[2] > interBox[3] || interBox[0] > interBox[1])
+        return 0.0f;
+
+    float interBoxS = (interBox[1] - interBox[0])*(interBox[3] - interBox[2]);
+    return interBoxS / (lbox[2] * lbox[3] + rbox[2] * rbox[3] - interBoxS);
+}
+
+bool cmp(const Yolo::Detection& a, const Yolo::Detection& b) {
+    return a.conf > b.conf;
+}
+
+void nms(std::vector<Yolo::Detection>& res, float *output, float conf_thresh, float nms_thresh) {
+    int det_size = sizeof(Yolo::Detection) / sizeof(float);
+    std::map<float, std::vector<Yolo::Detection>> m;
+    for (int i = 0; i < output[0] && i < Yolo::MAX_OUTPUT_BBOX_COUNT; i++) {
+        if (output[1 + det_size * i + 4] <= conf_thresh) continue;
+        Yolo::Detection det;
+        memcpy(&det, &output[1 + det_size * i], det_size * sizeof(float));
+        if (m.count(det.class_id) == 0) m.emplace(det.class_id, std::vector<Yolo::Detection>());
+        m[det.class_id].push_back(det);
+    }
+    for (auto it = m.begin(); it != m.end(); it++) {
+        //std::cout << it->second[0].class_id << " --- " << std::endl;
+        auto& dets = it->second;
+        std::sort(dets.begin(), dets.end(), cmp);
+        for (size_t m = 0; m < dets.size(); ++m) {
+            auto& item = dets[m];
+            res.push_back(item);
+            for (size_t n = m + 1; n < dets.size(); ++n) {
+                if (iou(item.bbox, dets[n].bbox) > nms_thresh) {
+                    dets.erase(dets.begin() + n);
+                    --n;
+                }
+            }
+        }
+    }
+}
+
+#define CONF_THRESH 0.5
+#define NMS_THRESH 0.4
+
+Napi::Value TensorRT::yolo(const Napi::CallbackInfo &info)
+{
+  Napi::Env env = info.Env();
+  Napi::Object inputobj = info[0].As<Napi::Object>();
+
+  if(!inputobj.HasOwnProperty("data") || !inputobj.HasOwnProperty("width") || !inputobj.HasOwnProperty("height")) {
+    Napi::Error::New(env, "Missing data/width/height").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  float conf_thresh = CONF_THRESH;
+  float nms_thresh = NMS_THRESH;
+
+  if(inputobj.HasOwnProperty("conf_thresh")) {
+    conf_thresh = inputobj.Get("conf_thresh").As<Napi::Number>().FloatValue();
+  }
+  if(inputobj.HasOwnProperty("nms_thresh")) {
+    nms_thresh = inputobj.Get("nms_thresh").As<Napi::Number>().FloatValue();
+  }
+
+  Napi::TypedArray arrdata = inputobj.Get("data").As<Napi::TypedArray>();
+  Napi::Float32Array jsdata = arrdata.As<Napi::Float32Array>();  
+
+  int width = inputobj.Get("width").As<Napi::Number>().Int32Value();
+  int height = inputobj.Get("height").As<Napi::Number>().Int32Value();
+
+  //doInference(*context, stream, buffers, data, prob, BATCH_SIZE);
+  std::vector<Yolo::Detection> res;
+  nms(res, jsdata.Data(), conf_thresh, nms_thresh);
+
+  Napi::Array retval = Napi::Array::New(env);
+
+  for (size_t j = 0; j < res.size(); j++) {
+    int rect[4];
+    get_rect(width, height, res[j].bbox, rect);
+    Napi::Object obj = Napi::Object::New(env);
+    obj.Set("x", rect[0]);
+    obj.Set("y", rect[1]);
+    obj.Set("w", rect[2]);
+    obj.Set("h", rect[3]);
+    obj.Set("id", (int)res[j].class_id);
+    retval.Set(j, obj);
+  }
+
+  return retval;
+}
 
 // Napi::Value TensorRT::fnAsync(const Napi::CallbackInfo &info)
 // {

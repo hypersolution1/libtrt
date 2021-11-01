@@ -1,16 +1,23 @@
 {
   "name": "libtrt",
-  "version": "0.1.0",
-  "description": "This library performs non-blocking inference on TensorRT models. Supports ONNX models.",
+  "version": "0.2.0",
+  "description": "This library performs non-blocking inference on TensorRT models.",
   "repository": {
     "type": "git",
     "url": "https://github.com/hypersolution1/libtrt.git"
   },
   "main": "addon.js",
-  "gypfile": true,
+  "gypfile": false,
   "dependencies": {
     "bindings": "~1.2.1",
     "node-addon-api": "^1.5.0"
+  },
+  "scripts": {
+    "install": "cmake-js compile -m",
+    "test": "node hello.js"
+  },
+  "devDependencies": {
+    "cmake-js": "^6.2.1"
   },
   "author": "Marc-André Marceau",
   "license": "ISC"

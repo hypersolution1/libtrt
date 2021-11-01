@@ -4,6 +4,8 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <map>
+#include <algorithm>
 #include <string.h>
 #include <assert.h>
 
@@ -15,6 +17,8 @@
 #include <cuda_runtime_api.h>
 #include "NvInfer.h"
 #include "NvOnnxParser.h"
+
+#include "yololayer.h"
 
 #include "promiseWorker.hpp"
 
@@ -39,6 +43,7 @@ class TensorRT : public Napi::ObjectWrap<TensorRT> {
     Napi::Value unload(const Napi::CallbackInfo& info);
     Napi::Value info(const Napi::CallbackInfo& info);
     Napi::Value execute(const Napi::CallbackInfo& info);
+    Napi::Value yolo(const Napi::CallbackInfo& info);
 
     //
     std::string cache_path;
@@ -48,6 +53,9 @@ class TensorRT : public Napi::ObjectWrap<TensorRT> {
     IExecutionContext *context{nullptr};
 
     int nbBindings;
+    int maxBatchSize;
+    int batchSize;
+    bool input_is_array;
     //Dims bufdims[MAXBINDINGS];
     int bufsize[MAXBINDINGS];
     float *cpubuf[MAXBINDINGS];
