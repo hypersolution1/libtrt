@@ -27,6 +27,7 @@ target_link_libraries(${PROJECT_NAME} ${CMAKE_JS_LIB})
 target_link_libraries(${PROJECT_NAME} nvinfer)
 target_link_libraries(${PROJECT_NAME} cudart)
 #target_link_libraries(${PROJECT_NAME} myplugins)
+target_link_libraries(${PROJECT_NAME} nvonnxparser)
 
 # Include Node-API wrappers
 execute_process(COMMAND node -p "require('node-addon-api').include"
