@@ -1,6 +1,6 @@
 {
   "name": "libtrt",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "This library performs non-blocking inference on TensorRT models.",
   "repository": {
     "type": "git",
