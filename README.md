@@ -13,7 +13,7 @@ This library performs non-blocking inference on tensorRT model.
 ```js
 
 var model = libTRT()
-await model.load("yolov5x.engine")
+await model.load("yolov5x.engine") // File generated for the target GPU from a .wts file (see https://github.com/ultralytics/yolov5/releases)
 
 console.log(model.info()) // Model inspection
 
@@ -29,6 +29,7 @@ var objs = model.yolo({ // This library includes a yolo post processing function
   data: out['prob'].data, // OR .data[i] if batch is used
   width: 640,
   height: 640,
+  input_size: 640, // or 1280 depending on your model 
   conf_thresh: 0.5,
   nms_thresh: 0.4,
 })

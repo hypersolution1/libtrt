@@ -578,22 +578,22 @@ Napi::Value TensorRT::execute(const Napi::CallbackInfo &info)
   return wk->Deferred().Promise();
 }
 
-void get_rect(int cols, int rows, float bbox[4], int *out) {
+void get_rect(int cols, int rows, float input_size, float bbox[4], int *out) {
     int l, r, t, b;
-    float r_w = Yolo::INPUT_W / (cols * 1.0);
-    float r_h = Yolo::INPUT_H / (rows * 1.0);
+    float r_w = input_size / (cols * 1.0);
+    float r_h = input_size / (rows * 1.0);
     if (r_h > r_w) {
         l = bbox[0] - bbox[2] / 2.f;
         r = bbox[0] + bbox[2] / 2.f;
-        t = bbox[1] - bbox[3] / 2.f - (Yolo::INPUT_H - r_w * rows) / 2;
-        b = bbox[1] + bbox[3] / 2.f - (Yolo::INPUT_H - r_w * rows) / 2;
+        t = bbox[1] - bbox[3] / 2.f - (input_size - r_w * rows) / 2;
+        b = bbox[1] + bbox[3] / 2.f - (input_size - r_w * rows) / 2;
         l = l / r_w;
         r = r / r_w;
         t = t / r_w;
         b = b / r_w;
     } else {
-        l = bbox[0] - bbox[2] / 2.f - (Yolo::INPUT_W - r_h * cols) / 2;
-        r = bbox[0] + bbox[2] / 2.f - (Yolo::INPUT_W - r_h * cols) / 2;
+        l = bbox[0] - bbox[2] / 2.f - (input_size - r_h * cols) / 2;
+        r = bbox[0] + bbox[2] / 2.f - (input_size - r_h * cols) / 2;
         t = bbox[1] - bbox[3] / 2.f;
         b = bbox[1] + bbox[3] / 2.f;
         l = l / r_h;
@@ -668,12 +668,16 @@ Napi::Value TensorRT::yolo(const Napi::CallbackInfo &info)
 
   float conf_thresh = CONF_THRESH;
   float nms_thresh = NMS_THRESH;
+  float input_size = 640.f;
 
   if(inputobj.HasOwnProperty("conf_thresh")) {
     conf_thresh = inputobj.Get("conf_thresh").As<Napi::Number>().FloatValue();
   }
   if(inputobj.HasOwnProperty("nms_thresh")) {
     nms_thresh = inputobj.Get("nms_thresh").As<Napi::Number>().FloatValue();
+  }
+  if(inputobj.HasOwnProperty("input_size")) {
+    input_size = inputobj.Get("input_size").As<Napi::Number>().FloatValue();
   }
 
   Napi::TypedArray arrdata = inputobj.Get("data").As<Napi::TypedArray>();
@@ -690,7 +694,7 @@ Napi::Value TensorRT::yolo(const Napi::CallbackInfo &info)
 
   for (size_t j = 0; j < res.size(); j++) {
     int rect[4];
-    get_rect(width, height, res[j].bbox, rect);
+    get_rect(width, height, input_size, res[j].bbox, rect);
     Napi::Object obj = Napi::Object::New(env);
     obj.Set("x", rect[0]);
     obj.Set("y", rect[1]);
