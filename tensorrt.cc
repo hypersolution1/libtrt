@@ -701,6 +701,7 @@ Napi::Value TensorRT::yolo(const Napi::CallbackInfo &info)
     obj.Set("w", rect[2]);
     obj.Set("h", rect[3]);
     obj.Set("id", (int)res[j].class_id);
+    obj.Set("conf", res[j].conf);
     retval.Set(j, obj);
   }
 
