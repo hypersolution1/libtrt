@@ -111,7 +111,7 @@ class Logger : public nvinfer1::ILogger
     //! Note samples should not be calling this function directly; it will eventually go away once we eliminate the inheritance from
     //! nvinfer1::ILogger
     //!
-    void log(Severity severity, const char* msg) override
+    void log(Severity severity, const char* msg) noexcept override
     {
       if(severity <= Severity::kWARNING) {
         std::cout << severityPrefix(severity) << " " << std::string(msg) << std::endl;
@@ -242,6 +242,8 @@ Napi::Value TensorRT::load(const Napi::CallbackInfo &info)
 {
   Napi::Env env = info.Env();
 
+  initLibNvInferPlugins(&myLogger.getTRTLogger(), "");
+
   std::string *inputpath = new std::string(info[0].As<Napi::String>());
   std::string *err = new std::string();
 
@@ -261,7 +263,7 @@ Napi::Value TensorRT::load(const Napi::CallbackInfo &info)
     std::string trtfile;
 
     const char *ext = get_filename_ext(inputpath->c_str());
-    if(strcmp(ext, "trt") == 0) {
+    if(strcmp(ext, "onnx") != 0) {
 
       use_trtfile = true;
       trtfile = (*inputpath);
@@ -340,7 +342,13 @@ Napi::Value TensorRT::load(const Napi::CallbackInfo &info)
       throw std::runtime_error("nbBindings > MAXBINDINGS");
     }
 
-    maxBatchSize = engine->getMaxBatchSize();
+    implicitBatch = engine->hasImplicitBatchDimension();
+    if(implicitBatch) {
+      maxBatchSize = engine->getMaxBatchSize();
+    } else {
+      Dims bufdims = engine->getBindingDimensions(0);
+      maxBatchSize = bufdims.d[0];
+    }
 
     //std::cout << "bindings: " << nbBindings << std::endl;
     for (int i = 0; i < nbBindings; ++i)
@@ -348,9 +356,12 @@ Napi::Value TensorRT::load(const Napi::CallbackInfo &info)
       //bool isinput = engine->bindingIsInput(i);
       //std::cout << "binding " << i << ":" << engine->getBindingName(i) << ((isinput) ? " is input " : " is output ");
       Dims bufdims = engine->getBindingDimensions(i);
+      nvinfer1::DataType type = engine->getBindingDataType(i);
+
       //std::cout << "[ ";
       int dataCnt = 1;
-      for (int j = 0; j < bufdims.nbDims; j++)
+      int dimIdx = (implicitBatch) ? 0 : 1;
+      for (int j = dimIdx; j < bufdims.nbDims; j++)
       {
         //std::cout << bufdims.d[j] << ((j == bufdims.nbDims - 1) ? " ]" : ", ");
         dataCnt *= bufdims.d[j];
@@ -358,12 +369,27 @@ Napi::Value TensorRT::load(const Napi::CallbackInfo &info)
       //std::cout << std::endl;
       bufsize[i] = dataCnt;
       dataCnt *= maxBatchSize;
-      cpubuf[i] = (float *)malloc(dataCnt * sizeof(float));
-      for (int j = 0; j < dataCnt; j++)
-      {
-        cpubuf[i][j] = 0.0;
+      switch(type) {
+        case nvinfer1::DataType::kFLOAT:
+        case nvinfer1::DataType::kINT32:
+          cpubuf[i] = malloc(dataCnt * sizeof(int32_t));
+          memset(cpubuf[i], 0, dataCnt * sizeof(int32_t));
+          CHECK_THREAD(cudaMalloc(&gpubuf[i], dataCnt * sizeof(int32_t)));
+          break;
+        case nvinfer1::DataType::kHALF:
+          cpubuf[i] = malloc(dataCnt * sizeof(int16_t));
+          memset(cpubuf[i], 0, dataCnt * sizeof(int16_t));
+          CHECK_THREAD(cudaMalloc(&gpubuf[i], dataCnt * sizeof(int16_t)));
+          break;
+        case nvinfer1::DataType::kINT8:
+        case nvinfer1::DataType::kBOOL:
+          cpubuf[i] = malloc(dataCnt * sizeof(int8_t));
+          memset(cpubuf[i], 0, dataCnt * sizeof(int8_t));
+          CHECK_THREAD(cudaMalloc(&gpubuf[i], dataCnt * sizeof(int8_t)));
+          break;
+        default:
+        throw std::runtime_error("getBindingDataType unsupported");
       }
-      CHECK_THREAD(cudaMalloc(&gpubuf[i], dataCnt * sizeof(float)));
     }
 
   },
@@ -396,12 +422,14 @@ Napi::Value TensorRT::unload(const Napi::CallbackInfo &info)
   return env.Undefined();
 }
 
+const char * const dataTypeNames[] = { "kFLOAT", "kHALF", "kINT8", "kINT32", "kBOOL" };
+
 Napi::Value TensorRT::info(const Napi::CallbackInfo &info)
 {
   Napi::Env env = info.Env();
   Napi::Object retval = Napi::Object::New(env);
   Napi::Array inputs = Napi::Array::New(env);
-  Napi::Array outputs = Napi::Array::New(env);  
+  Napi::Array outputs = Napi::Array::New(env);
   retval.Set("maxBatchSize", Napi::Number::New(env, maxBatchSize));
   retval.Set("inputs", inputs);
   retval.Set("outputs", outputs);
@@ -413,16 +441,19 @@ Napi::Value TensorRT::info(const Napi::CallbackInfo &info)
   {
     bool isinput = engine->bindingIsInput(i);
     std::string name(engine->getBindingName(i));
+    nvinfer1::DataType type = engine->getBindingDataType(i);
 
     Dims bufdims = engine->getBindingDimensions(i);
     Napi::Array arrdim = Napi::Array::New(env);
-    for (int j = 0; j < bufdims.nbDims; j++)
+    int dimIdx = (implicitBatch) ? 0 : 1;
+    for (int j = dimIdx; j < bufdims.nbDims; j++)
     {
-      arrdim.Set(j, Napi::Number::New(env, bufdims.d[j]));
+      arrdim.Set(j-dimIdx, Napi::Number::New(env, bufdims.d[j]));
     }
 
     Napi::Object binding = Napi::Object::New(env);
     binding.Set("name", Napi::String::New(env, name));
+    binding.Set("type", Napi::String::New(env, dataTypeNames[(int)type]));
     binding.Set("dim", arrdim);
 
     if(isinput) {
@@ -459,9 +490,10 @@ Napi::Value TensorRT::execute(const Napi::CallbackInfo &info)
       }
       Napi::Object input = inputs.Get(name).As<Napi::Object>();
       Napi::Array arrdim = input.Get("dim").As<Napi::Array>();
-      for (int j = 0; j < bufdims.nbDims; j++)
+      int dimIdx = (implicitBatch) ? 0 : 1;
+      for (int j = dimIdx; j < bufdims.nbDims; j++)
       {
-        Napi::Value dimval = arrdim.Get(j);
+        Napi::Value dimval = arrdim.Get(j-dimIdx);
         if(!dimval.IsNumber()) {
           Napi::Error::New(env, "Bad Dimensions").ThrowAsJavaScriptException();
           return env.Undefined();
@@ -489,10 +521,11 @@ Napi::Value TensorRT::execute(const Napi::CallbackInfo &info)
         Napi::Error::New(env, "Input greater than maximum batch size").ThrowAsJavaScriptException();
         return env.Undefined();
       }
+      //TODO: handle different datatypes
       for(int j = 0; j < batchSize; j++) {
         Napi::TypedArray arrdata = arrbatchData.Get(j).As<Napi::TypedArray>();
         Napi::Float32Array arrdata_float = arrdata.As<Napi::Float32Array>();
-        std::copy(arrdata_float.Data(), arrdata_float.Data() + bufsize[i], cpubuf[i] + (j * bufsize[i]));
+        std::copy(arrdata_float.Data(), arrdata_float.Data() + bufsize[i], (float*)cpubuf[i] + (j * bufsize[i]));
       }
 
       // Napi::TypedArray arrdata = input.Get("data").As<Napi::TypedArray>();
@@ -511,16 +544,34 @@ Napi::Value TensorRT::execute(const Napi::CallbackInfo &info)
     for (int i = 0; i < nbBindings; i++)
     {
       if(engine->bindingIsInput(i)) {
+        //TODO: handle different datatypes
         CHECK_THREAD(cudaMemcpyAsync(gpubuf[i], cpubuf[i], maxBatchSize * bufsize[i] * sizeof(float), cudaMemcpyHostToDevice, stream));
       }
     }
 
+#if NV_TENSORRT_MAJOR >= 8
+    context->enqueueV2(gpubuf, stream, nullptr);
+#else
     context->enqueue(maxBatchSize, gpubuf, stream, nullptr);
+#endif
 
     for (int i = 0; i < nbBindings; i++)
     {
       if(!engine->bindingIsInput(i)) {
-        CHECK_THREAD(cudaMemcpyAsync(cpubuf[i], gpubuf[i], maxBatchSize * bufsize[i] * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        nvinfer1::DataType type = engine->getBindingDataType(i);
+        switch(type) {
+          case nvinfer1::DataType::kFLOAT:
+          case nvinfer1::DataType::kINT32:
+            CHECK_THREAD(cudaMemcpyAsync(cpubuf[i], gpubuf[i], maxBatchSize * bufsize[i] * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            break;
+          case nvinfer1::DataType::kHALF:
+            CHECK_THREAD(cudaMemcpyAsync(cpubuf[i], gpubuf[i], maxBatchSize * bufsize[i] * sizeof(int16_t), cudaMemcpyDeviceToHost, stream));
+            break;
+          case nvinfer1::DataType::kINT8:
+          case nvinfer1::DataType::kBOOL:
+            CHECK_THREAD(cudaMemcpyAsync(cpubuf[i], gpubuf[i], maxBatchSize * bufsize[i] * sizeof(int8_t), cudaMemcpyDeviceToHost, stream));
+            break;
+        }        
       }
     }
 
@@ -531,47 +582,68 @@ Napi::Value TensorRT::execute(const Napi::CallbackInfo &info)
   },
   [=](Napi::Env env) -> Napi::Value {
 
-    Napi::Object retval = Napi::Object::New(env);
+    Napi::Array arrRet = Napi::Array::New(env);
 
-    for (int i = 0; i < nbBindings; ++i)
-    {
-      bool isoutput = !engine->bindingIsInput(i);
-      if(isoutput) {
-        std::string name(engine->getBindingName(i));
+    for(int j = 0; j < batchSize; j++) {
+      
+      Napi::Object retval = Napi::Object::New(env);
+      
+      for (int i = 0; i < nbBindings; ++i) {
 
-        Dims bufdims = engine->getBindingDimensions(i);
-        Napi::Array arrdim = Napi::Array::New(env);
-        for (int j = 0; j < bufdims.nbDims; j++)
-        {
-          arrdim.Set(j, Napi::Number::New(env, bufdims.d[j]));
+        bool isoutput = !engine->bindingIsInput(i);
+        if(isoutput) {
+          std::string name(engine->getBindingName(i));
+          nvinfer1::DataType type = engine->getBindingDataType(i);
+
+          Dims bufdims = engine->getBindingDimensions(i);
+          Napi::Array arrdim = Napi::Array::New(env);
+          int dimIdx = (implicitBatch) ? 0 : 1;
+          for (int k = dimIdx; k < bufdims.nbDims; k++)
+          {
+            arrdim.Set(k-dimIdx, Napi::Number::New(env, bufdims.d[k]));
+          }
+          
+          Napi::Object binding = Napi::Object::New(env);
+          binding.Set("dim", arrdim);
+
+          Napi::Float32Array f32data;
+          Napi::Int32Array i32data;
+          Napi::Int8Array i8data;
+
+          switch(type) {
+            case nvinfer1::DataType::kFLOAT:
+              f32data = Napi::Float32Array::New(env, bufsize[i]);
+              std::copy((float*)cpubuf[i] + (j * bufsize[i]), (float*)cpubuf[i] + ((j+1) * bufsize[i]), f32data.Data());
+              binding.Set("data", f32data);
+              break;
+            case nvinfer1::DataType::kINT32:
+              i32data = Napi::Int32Array::New(env, bufsize[i]);
+              std::copy((int32_t*)cpubuf[i] + (j * bufsize[i]), (int32_t*)cpubuf[i] + ((j+1) * bufsize[i]), i32data.Data());
+              binding.Set("data", i32data);
+              break;
+            case nvinfer1::DataType::kHALF:
+              //TODO: handle kHALF
+              break;
+            case nvinfer1::DataType::kINT8:
+            case nvinfer1::DataType::kBOOL:
+              i8data = Napi::Int8Array::New(env, bufsize[i]);
+              std::copy((int8_t*)cpubuf[i] + (j * bufsize[i]), (int8_t*)cpubuf[i] + ((j+1) * bufsize[i]), i8data.Data());
+              binding.Set("data", i8data);
+              break;
+          }
+
+          retval.Set(name, binding);
+
         }
-        
-        Napi::Object binding = Napi::Object::New(env);
-        binding.Set("dim", arrdim);
-
-        Napi::Array arrdata = Napi::Array::New(env);
-        for(int j = 0; j < batchSize; j++) {
-          Napi::Float32Array data = Napi::Float32Array::New(env, bufsize[i]);
-          std::copy(cpubuf[i] + (j * bufsize[i]), cpubuf[i] + ((j+1) * bufsize[i]), data.Data());
-          arrdata.Set(j, data);
-        }
-        if(input_is_array) {
-          binding.Set("data", arrdata);
-        } else {
-          //Napi::Value val = .As<Napi::Value>();
-          binding.Set("data", arrdata.Get((int)0));
-        }
-
-        // Napi::Float32Array data = Napi::Float32Array::New(env, bufsize[i]);
-        // std::copy(cpubuf[i], cpubuf[i] + bufsize[i], data.Data());
-        // binding.Set("data", data);
-
-        retval.Set(name, binding);
-
       }
+      arrRet.Set(j, retval);
     }
 
-    return retval;
+    return arrRet;
+
+    // Napi::Float32Array data = Napi::Float32Array::New(env, bufsize[i]);
+    // std::copy(cpubuf[i], cpubuf[i] + bufsize[i], data.Data());
+    // binding.Set("data", data);
 
   });
   wk->Queue();

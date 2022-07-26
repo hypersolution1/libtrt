@@ -16,6 +16,7 @@
 
 #include <cuda_runtime_api.h>
 #include "NvInfer.h"
+#include "NvInferPlugin.h"
 #include "NvOnnxParser.h"
 
 #include "yololayer.h"
@@ -53,12 +54,13 @@ class TensorRT : public Napi::ObjectWrap<TensorRT> {
     IExecutionContext *context{nullptr};
 
     int nbBindings;
+    bool implicitBatch;
     int maxBatchSize;
     int batchSize;
     bool input_is_array;
     //Dims bufdims[MAXBINDINGS];
     int bufsize[MAXBINDINGS];
-    float *cpubuf[MAXBINDINGS];
+    void *cpubuf[MAXBINDINGS];
     void *gpubuf[MAXBINDINGS];
 
 };
